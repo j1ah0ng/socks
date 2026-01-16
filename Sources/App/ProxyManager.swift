@@ -1,34 +1,36 @@
 import Foundation
 import Network
-import CoreLocation
+@preconcurrency import CoreLocation
+import UIKit
 import OSLog
 
 private let logger = Logger(subsystem: "com.socksproxy", category: "ProxyManager")
 
 /// Observable object managing the SOCKS proxy server state for SwiftUI
-@MainActor
 final class ProxyManager: NSObject, ObservableObject {
     static let defaultPort: UInt16 = 1080
     private static let portKey = "SOCKSProxyPort"
     private static let backgroundKey = "SOCKSProxyBackground"
 
-    @Published private(set) var isRunning = false
-    @Published private(set) var errorMessage: String?
-    @Published var port: UInt16 {
+    @MainActor @Published private(set) var isRunning = false
+    @MainActor @Published private(set) var errorMessage: String?
+    @MainActor @Published var port: UInt16 {
         didSet {
             UserDefaults.standard.set(Int(port), forKey: Self.portKey)
         }
     }
-    @Published var backgroundEnabled: Bool {
+    @MainActor @Published var backgroundEnabled: Bool {
         didSet {
             UserDefaults.standard.set(backgroundEnabled, forKey: Self.backgroundKey)
             updateBackgroundMode()
         }
     }
+    @MainActor @Published private(set) var backgroundActive = false
 
     private var server: SOCKSServer?
     private var locationManager: CLLocationManager?
 
+    @MainActor
     var proxyAddress: String {
         guard isRunning else { return "Not running" }
         if let hotspotIP = getHotspotIPAddress() {
@@ -39,11 +41,17 @@ final class ProxyManager: NSObject, ObservableObject {
 
     override init() {
         let savedPort = UserDefaults.standard.integer(forKey: Self.portKey)
-        self.port = savedPort > 0 ? UInt16(savedPort) : Self.defaultPort
-        self.backgroundEnabled = UserDefaults.standard.bool(forKey: Self.backgroundKey)
+        let port = savedPort > 0 ? UInt16(savedPort) : Self.defaultPort
+        let backgroundEnabled = UserDefaults.standard.bool(forKey: Self.backgroundKey)
+
+        // Initialize stored properties before super.init()
+        self._port = Published(wrappedValue: port)
+        self._backgroundEnabled = Published(wrappedValue: backgroundEnabled)
+
         super.init()
     }
 
+    @MainActor
     func startProxy() {
         guard !isRunning else { return }
 
@@ -51,13 +59,13 @@ final class ProxyManager: NSObject, ObservableObject {
         server = SOCKSServer(port: port)
 
         server?.onStateChange = { [weak self] running in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 self?.isRunning = running
             }
         }
 
         server?.onError = { [weak self] error in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 self?.errorMessage = error.localizedDescription
             }
         }
@@ -72,6 +80,7 @@ final class ProxyManager: NSObject, ObservableObject {
         }
     }
 
+    @MainActor
     func stopProxy() {
         server?.stop()
         server = nil
@@ -79,6 +88,7 @@ final class ProxyManager: NSObject, ObservableObject {
         logger.info("Proxy stopped")
     }
 
+    @MainActor
     func toggleProxy() {
         if isRunning {
             stopProxy()
@@ -89,6 +99,7 @@ final class ProxyManager: NSObject, ObservableObject {
 
     // MARK: - Background Mode
 
+    @MainActor
     private func updateBackgroundMode() {
         if backgroundEnabled && isRunning {
             startBackgroundMode()
@@ -97,25 +108,48 @@ final class ProxyManager: NSObject, ObservableObject {
         }
     }
 
+    @MainActor
     private func startBackgroundMode() {
         guard locationManager == nil else { return }
 
-        locationManager = CLLocationManager()
-        locationManager?.delegate = self
-        locationManager?.desiredAccuracy = kCLLocationAccuracyThreeKilometers
-        locationManager?.distanceFilter = 1000 // meters
-        locationManager?.allowsBackgroundLocationUpdates = true
-        locationManager?.pausesLocationUpdatesAutomatically = false
+        let manager = CLLocationManager()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        manager.distanceFilter = 1000 // meters
+        manager.allowsBackgroundLocationUpdates = true
+        manager.pausesLocationUpdatesAutomatically = false
+        manager.showsBackgroundLocationIndicator = true
+        locationManager = manager
 
-        // Request always authorization for background
-        locationManager?.requestAlwaysAuthorization()
+        // Check current authorization and act accordingly
+        let status = manager.authorizationStatus
+        logger.info("Background mode starting, current auth status: \(status.rawValue)")
 
-        logger.info("Background mode enabled via location services")
+        switch status {
+        case .authorizedAlways:
+            logger.info("Already authorized always - starting location updates")
+            manager.startUpdatingLocation()
+        case .authorizedWhenInUse:
+            logger.info("Authorized when in use - requesting always, starting updates")
+            manager.requestAlwaysAuthorization()
+            manager.startUpdatingLocation()
+        case .notDetermined:
+            logger.info("Not determined - requesting always authorization")
+            manager.requestAlwaysAuthorization()
+        case .denied, .restricted:
+            logger.error("Location access denied/restricted")
+            errorMessage = "Location access required for background mode"
+            backgroundEnabled = false
+        @unknown default:
+            manager.requestAlwaysAuthorization()
+        }
     }
 
+    @MainActor
     private func stopBackgroundMode() {
         locationManager?.stopUpdatingLocation()
         locationManager = nil
+        backgroundActive = false
         logger.info("Background mode disabled")
     }
 
@@ -156,32 +190,47 @@ final class ProxyManager: NSObject, ObservableObject {
 // MARK: - CLLocationManagerDelegate
 
 extension ProxyManager: CLLocationManagerDelegate {
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         // We don't need the location, just the background execution time
+        logger.debug("Location update (keeping alive)")
+
+        // Only update UI state when app is active to avoid concurrency issues
+        DispatchQueue.main.async { [weak self] in
+            guard UIApplication.shared.applicationState == .active else { return }
+            if self?.backgroundActive == false {
+                self?.backgroundActive = true
+                logger.info("Background mode now active")
+            }
+        }
     }
 
-    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        Task { @MainActor in
-            switch manager.authorizationStatus {
-            case .authorizedAlways:
-                logger.info("Location always authorized - starting updates")
-                manager.startUpdatingLocation()
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        logger.info("Authorization changed to: \(status.rawValue)")
+
+        // Start location updates immediately (don't wait for main queue)
+        if status == .authorizedAlways || status == .authorizedWhenInUse {
+            manager.startUpdatingLocation()
+        }
+
+        // Update UI only when app is active
+        DispatchQueue.main.async { [weak self] in
+            guard UIApplication.shared.applicationState == .active else { return }
+            switch status {
             case .authorizedWhenInUse:
-                logger.warning("Only authorized when in use - background mode limited")
-                manager.startUpdatingLocation()
+                logger.warning("Only 'When In Use' - grant 'Always' for reliable background operation.")
             case .denied, .restricted:
                 logger.error("Location access denied")
-                self.errorMessage = "Location access required for background mode"
-                self.backgroundEnabled = false
-            case .notDetermined:
-                logger.info("Location authorization not determined")
-            @unknown default:
+                self?.errorMessage = "Location access required for background mode"
+                self?.backgroundEnabled = false
+            default:
                 break
             }
         }
     }
 
-    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        logger.error("Location error: \(error.localizedDescription)")
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // Ignore errors - we don't actually need accurate location
+        logger.debug("Location error (ignored): \(error.localizedDescription)")
     }
 }

@@ -111,6 +111,17 @@ Settings → Network Settings → Manual proxy → SOCKS Host: 172.20.10.1:1080
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --proxy-server="socks5://172.20.10.1:1080"
 ```
 
+### TTL Configuration (Optional)
+
+To fully mask proxied traffic origin, set your packet TTL to 65 on the connected device:
+
+```bash
+sudo sysctl net.inet.ip.ttl=65    # Set default TTL for IPv4 packets
+sudo sysctl net.inet6.ip6.hlim=65 # Set default TTL for IPv6 packets
+```
+
+This ensures packets leaving your device have the same TTL as if they originated from the iPhone itself.
+
 ## Background Mode
 
 The app uses iOS location services to remain active in the background. When enabled:

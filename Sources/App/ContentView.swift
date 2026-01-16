@@ -98,15 +98,15 @@ struct ContentView: View {
 
             if proxyManager.backgroundEnabled {
                 HStack {
-                    Image(systemName: "location.fill")
-                        .foregroundStyle(.blue)
-                    Text("Using location services to stay active")
+                    Image(systemName: proxyManager.backgroundActive ? "location.fill" : "location")
+                        .foregroundStyle(proxyManager.backgroundActive ? .blue : .secondary)
+                    Text(proxyManager.backgroundActive ? "Background mode active" : "Waiting for location permission...")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(proxyManager.backgroundActive ? .primary : .secondary)
                 }
             }
         } footer: {
-            Text("Enables location services to keep the proxy running when the app is in the background. Uses minimal battery.")
+            Text("Requires \"Always\" location permission. Uses minimal battery (3km accuracy).")
         }
     }
 }
