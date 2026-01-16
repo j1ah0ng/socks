@@ -115,9 +115,16 @@ Settings → Network Settings → Manual proxy → SOCKS Host: 172.20.10.1:1080
 
 To fully mask proxied traffic origin, set your packet TTL to 65 on the connected device:
 
+**macOS:**
 ```bash
 sudo sysctl net.inet.ip.ttl=65    # Set default TTL for IPv4 packets
 sudo sysctl net.inet6.ip6.hlim=65 # Set default TTL for IPv6 packets
+```
+
+**Linux:**
+```bash
+sudo sysctl -w net.ipv4.ip_default_ttl=65    # Set default TTL for IPv4 packets
+sudo sysctl -w net.ipv6.conf.all.hop_limit=65 # Set default TTL for IPv6 packets
 ```
 
 This ensures packets leaving your device have the same TTL as if they originated from the iPhone itself.

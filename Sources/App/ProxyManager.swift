@@ -29,14 +29,20 @@ final class ProxyManager: NSObject, ObservableObject {
 
     private var server: SOCKSServer?
     private var locationManager: CLLocationManager?
+    private var pathMonitor: NWPathMonitor?
+
+    // Triggers SwiftUI refresh when network changes
+    @MainActor @Published private(set) var networkStateToken = 0
 
     @MainActor
     var proxyAddress: String {
+        // Access token to trigger SwiftUI refresh on network changes
+        _ = networkStateToken
         guard isRunning else { return "Not running" }
         if let hotspotIP = getHotspotIPAddress() {
             return "\(hotspotIP):\(port)"
         }
-        return "0.0.0.0:\(port)"
+        return "Enable Hotspot to get address"
     }
 
     override init() {
@@ -73,6 +79,7 @@ final class ProxyManager: NSObject, ObservableObject {
         do {
             try server?.start()
             logger.info("Proxy started on port \(self.port)")
+            startNetworkMonitor()
             updateBackgroundMode()
         } catch {
             errorMessage = error.localizedDescription
@@ -80,10 +87,26 @@ final class ProxyManager: NSObject, ObservableObject {
         }
     }
 
+    private func startNetworkMonitor() {
+        pathMonitor = NWPathMonitor()
+        pathMonitor?.pathUpdateHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.networkStateToken += 1
+            }
+        }
+        pathMonitor?.start(queue: DispatchQueue.global(qos: .utility))
+    }
+
+    private func stopNetworkMonitor() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+    }
+
     @MainActor
     func stopProxy() {
         server?.stop()
         server = nil
+        stopNetworkMonitor()
         stopBackgroundMode()
         logger.info("Proxy stopped")
     }
@@ -129,10 +152,12 @@ final class ProxyManager: NSObject, ObservableObject {
         case .authorizedAlways:
             logger.info("Already authorized always - starting location updates")
             manager.startUpdatingLocation()
+            backgroundActive = true
         case .authorizedWhenInUse:
             logger.info("Authorized when in use - requesting always, starting updates")
             manager.requestAlwaysAuthorization()
             manager.startUpdatingLocation()
+            backgroundActive = true
         case .notDetermined:
             logger.info("Not determined - requesting always authorization")
             manager.requestAlwaysAuthorization()

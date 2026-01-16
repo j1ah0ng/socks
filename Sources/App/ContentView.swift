@@ -2,12 +2,14 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
-    @State private var showingSettings = false
+    @State private var showingInfo = false
+    @State private var portText: String = ""
 
     var body: some View {
         NavigationStack {
             List {
                 statusSection
+                portSection
                 addressSection
                 backgroundSection
             }
@@ -15,14 +17,17 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        showingSettings = true
+                        showingInfo = true
                     } label: {
-                        Image(systemName: "gear")
+                        Image(systemName: "info.circle")
                     }
                 }
             }
-            .sheet(isPresented: $showingSettings) {
-                SettingsView(port: $proxyManager.port, isRunning: proxyManager.isRunning)
+            .sheet(isPresented: $showingInfo) {
+                InfoView()
+            }
+            .onAppear {
+                portText = String(proxyManager.port)
             }
         }
     }
@@ -66,6 +71,29 @@ struct ContentView: View {
         }
     }
 
+    private var portSection: some View {
+        Section {
+            HStack {
+                Text("Port")
+                Spacer()
+                TextField("1080", text: $portText)
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                    .disabled(proxyManager.isRunning)
+                    .onChange(of: portText) { _, newValue in
+                        if let newPort = UInt16(newValue), newPort > 0 {
+                            proxyManager.port = newPort
+                        }
+                    }
+            }
+        } footer: {
+            if proxyManager.isRunning {
+                Text("Stop the proxy to change port")
+            }
+        }
+    }
+
     private var addressSection: some View {
         Section("Proxy Address") {
             HStack {
@@ -96,13 +124,12 @@ struct ContentView: View {
         Section {
             Toggle("Run in Background", isOn: $proxyManager.backgroundEnabled)
 
-            if proxyManager.backgroundEnabled {
+            if proxyManager.backgroundEnabled && proxyManager.backgroundActive {
                 HStack {
-                    Image(systemName: proxyManager.backgroundActive ? "location.fill" : "location")
-                        .foregroundStyle(proxyManager.backgroundActive ? .blue : .secondary)
-                    Text(proxyManager.backgroundActive ? "Background mode active" : "Waiting for location permission...")
+                    Image(systemName: "location.fill")
+                        .foregroundStyle(.blue)
+                    Text("Background mode active")
                         .font(.caption)
-                        .foregroundStyle(proxyManager.backgroundActive ? .primary : .secondary)
                 }
             }
         } footer: {
@@ -111,35 +138,14 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Settings View
+// MARK: - Info View
 
-struct SettingsView: View {
+struct InfoView: View {
     @Environment(\.dismiss) private var dismiss
-    @Binding var port: UInt16
-    let isRunning: Bool
-    @State private var portText: String = ""
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Server Configuration") {
-                    HStack {
-                        Text("Port")
-                        Spacer()
-                        TextField("1080", text: $portText)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: 80)
-                            .disabled(isRunning)
-                    }
-
-                    if isRunning {
-                        Text("Stop the proxy to change port")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
                 Section("Usage") {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("1. Start the proxy server")
@@ -151,25 +157,51 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                Section("TTL Configuration") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("To fully mask proxied traffic origin, run on the connected device:")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("macOS:")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("sudo sysctl net.inet.ip.ttl=65")
+                                Text("sudo sysctl net.inet6.ip6.hlim=65")
+                            }
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                        }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Linux:")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("sudo sysctl -w net.ipv4.ip_default_ttl=65")
+                                Text("sudo sysctl -w net.ipv6.conf.all.hop_limit=65")
+                            }
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                        }
+                    }
+                }
+
                 Section("About") {
                     LabeledContent("Protocol", value: "SOCKS5")
                     LabeledContent("Authentication", value: "None")
                 }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("Info")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
-                        if let newPort = UInt16(portText), newPort > 0 {
-                            port = newPort
-                        }
                         dismiss()
                     }
                 }
-            }
-            .onAppear {
-                portText = String(port)
             }
         }
     }
