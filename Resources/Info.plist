@@ -24,11 +24,19 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>SOCKS Proxy needs local network access to accept connections from devices on your hotspot.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>SOCKS Proxy uses location services to keep the proxy running in the background. Your location is not stored or transmitted.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>SOCKS Proxy uses location services to keep the proxy running in the background. Your location is not stored or transmitted.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
 	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

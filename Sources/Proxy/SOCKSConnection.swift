@@ -46,6 +46,9 @@ final class SOCKSConnection {
     }
 
     func start() {
+        // Notify about new connection immediately
+        statsCallback(stats)
+
         clientConnection.stateUpdateHandler = { [weak self] state in
             self?.handleClientStateChange(state)
         }
@@ -255,7 +258,6 @@ final class SOCKSConnection {
                 self?.cancel()
                 return
             }
-            self?.stats.bytesOut += Int64(data.count)
             completion()
         })
     }

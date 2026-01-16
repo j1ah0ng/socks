@@ -9,8 +9,7 @@ struct ContentView: View {
             List {
                 statusSection
                 addressSection
-                statisticsSection
-                connectionsSection
+                backgroundSection
             }
             .navigationTitle("SOCKS Proxy")
             .toolbar {
@@ -93,63 +92,22 @@ struct ContentView: View {
         }
     }
 
-    private var statisticsSection: some View {
-        Section("Statistics") {
-            LabeledContent("Active Connections") {
-                Text("\(proxyManager.activeConnections.count)")
-                    .fontWeight(.medium)
-            }
+    private var backgroundSection: some View {
+        Section {
+            Toggle("Run in Background", isOn: $proxyManager.backgroundEnabled)
 
-            LabeledContent("Data In") {
-                Text(proxyManager.formatBytes(proxyManager.totalBytesIn))
-                    .fontWeight(.medium)
-            }
-
-            LabeledContent("Data Out") {
-                Text(proxyManager.formatBytes(proxyManager.totalBytesOut))
-                    .fontWeight(.medium)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var connectionsSection: some View {
-        if !proxyManager.activeConnections.isEmpty {
-            Section("Active Connections") {
-                ForEach(proxyManager.activeConnections) { connection in
-                    ConnectionRow(connection: connection, proxyManager: proxyManager)
+            if proxyManager.backgroundEnabled {
+                HStack {
+                    Image(systemName: "location.fill")
+                        .foregroundStyle(.blue)
+                    Text("Using location services to stay active")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
+        } footer: {
+            Text("Enables location services to keep the proxy running when the app is in the background. Uses minimal battery.")
         }
-    }
-}
-
-// MARK: - Connection Row
-
-struct ConnectionRow: View {
-    let connection: ConnectionStats
-    let proxyManager: ProxyManager
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if let host = connection.destinationHost, let port = connection.destinationPort {
-                Text("\(host):\(port)")
-                    .font(.system(.subheadline, design: .monospaced))
-            } else {
-                Text("Handshaking...")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 12) {
-                Label(proxyManager.formatBytes(connection.bytesIn), systemImage: "arrow.down")
-                Label(proxyManager.formatBytes(connection.bytesOut), systemImage: "arrow.up")
-                Label(proxyManager.formatDuration(connection.startTime), systemImage: "clock")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 2)
     }
 }
 

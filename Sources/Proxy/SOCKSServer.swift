@@ -27,8 +27,7 @@ final class SOCKSServer {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
 
-        // Allow connections from any interface (important for hotspot)
-        parameters.requiredInterfaceType = .wifi
+        // Don't restrict interface type - hotspot uses bridge interface
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw SOCKSServerError.invalidPort
@@ -99,8 +98,18 @@ final class SOCKSServer {
         logger.info("New connection from \(String(describing: endpoint))")
 
         let socksConnection = SOCKSConnection(connection: connection) { [weak self] stats in
+            logger.debug("Connection stats callback: \(stats.id) in=\(stats.bytesIn) out=\(stats.bytesOut)")
+
             DispatchQueue.main.async {
-                self?.onConnectionUpdate?(stats)
+                guard let self = self else {
+                    logger.warning("Server deallocated, dropping stats update")
+                    return
+                }
+                guard let callback = self.onConnectionUpdate else {
+                    logger.warning("No onConnectionUpdate callback set")
+                    return
+                }
+                callback(stats)
             }
 
             if stats.state == .closed {

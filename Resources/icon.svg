@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- White background -->
+  <rect width="1024" height="1024" fill="white"/>
+
+  <!-- Left sock -->
+  <g transform="translate(180, 120)">
+    <!-- Sock cuff -->
+    <rect x="40" y="0" width="180" height="80" rx="10" fill="#808080"/>
+    <rect x="40" y="60" width="180" height="30" fill="#909090"/>
+
+    <!-- Sock leg -->
+    <path d="M40 80 L40 400 Q40 480 100 520 L160 560 Q260 620 280 680 L280 720 Q280 780 220 780 L80 780 Q20 780 20 720 L20 600 Q20 520 80 480 L120 450 Q160 420 160 380 L160 80 Z"
+          fill="#707070"/>
+
+    <!-- Sock heel accent -->
+    <ellipse cx="60" cy="620" rx="50" ry="80" fill="#606060"/>
+
+    <!-- Sock toe accent -->
+    <ellipse cx="150" cy="750" rx="100" ry="40" fill="#606060"/>
+
+    <!-- Ribbing lines on cuff -->
+    <line x1="60" y1="20" x2="60" y2="70" stroke="#606060" stroke-width="3"/>
+    <line x1="90" y1="20" x2="90" y2="70" stroke="#606060" stroke-width="3"/>
+    <line x1="120" y1="20" x2="120" y2="70" stroke="#606060" stroke-width="3"/>
+    <line x1="150" y1="20" x2="150" y2="70" stroke="#606060" stroke-width="3"/>
+    <line x1="180" y1="20" x2="180" y2="70" stroke="#606060" stroke-width="3"/>
+    <line x1="200" y1="20" x2="200" y2="70" stroke="#606060" stroke-width="3"/>
+  </g>
+
+  <!-- Right sock (slightly offset and rotated) -->
+  <g transform="translate(520, 140) rotate(5)">
+    <!-- Sock cuff -->
+    <rect x="40" y="0" width="180" height="80" rx="10" fill="#888888"/>
+    <rect x="40" y="60" width="180" height="30" fill="#989898"/>
+
+    <!-- Sock leg -->
+    <path d="M40 80 L40 400 Q40 480 100 520 L160 560 Q260 620 280 680 L280 720 Q280 780 220 780 L80 780 Q20 780 20 720 L20 600 Q20 520 80 480 L120 450 Q160 420 160 380 L160 80 Z"
+          fill="#787878"/>
+
+    <!-- Sock heel accent -->
+    <ellipse cx="60" cy="620" rx="50" ry="80" fill="#686868"/>
+
+    <!-- Sock toe accent -->
+    <ellipse cx="150" cy="750" rx="100" ry="40" fill="#686868"/>
+
+    <!-- Ribbing lines on cuff -->
+    <line x1="60" y1="20" x2="60" y2="70" stroke="#686868" stroke-width="3"/>
+    <line x1="90" y1="20" x2="90" y2="70" stroke="#686868" stroke-width="3"/>
+    <line x1="120" y1="20" x2="120" y2="70" stroke="#686868" stroke-width="3"/>
+    <line x1="150" y1="20" x2="150" y2="70" stroke="#686868" stroke-width="3"/>
+    <line x1="180" y1="20" x2="180" y2="70" stroke="#686868" stroke-width="3"/>
+    <line x1="200" y1="20" x2="200" y2="70" stroke="#686868" stroke-width="3"/>
+  </g>
+</svg>
