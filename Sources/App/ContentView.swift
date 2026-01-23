@@ -1,4 +1,6 @@
 import SwiftUI
+import CoreLocation
+import UIKit
 
 struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
@@ -124,12 +126,44 @@ struct ContentView: View {
         Section {
             Toggle("Run in Background", isOn: $proxyManager.backgroundEnabled)
 
-            if proxyManager.backgroundEnabled && proxyManager.backgroundActive {
-                HStack {
-                    Image(systemName: "location.fill")
-                        .foregroundStyle(.blue)
-                    Text("Background mode active")
-                        .font(.caption)
+            if proxyManager.backgroundEnabled {
+                if proxyManager.backgroundActive {
+                    HStack {
+                        Image(systemName: "location.fill")
+                            .foregroundStyle(.green)
+                        Text("Background mode active")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                } else if proxyManager.locationAuthStatus == .authorizedWhenInUse {
+                    // Critical warning - "When In Use" won't work
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text("\"When In Use\" won't keep proxy alive")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.orange)
+                        }
+
+                        Button {
+                            if let url = URL(string: UIApplication.openSettingsURLString) {
+                                UIApplication.shared.open(url)
+                            }
+                        } label: {
+                            Label("Open Settings → Change to \"Always\"", systemImage: "gear")
+                                .font(.caption)
+                        }
+                    }
+                } else if proxyManager.locationAuthStatus == .notDetermined {
+                    HStack {
+                        Image(systemName: "location")
+                            .foregroundStyle(.secondary)
+                        Text("Grant location permission")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         } footer: {

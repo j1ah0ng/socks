@@ -26,6 +26,7 @@ final class ProxyManager: NSObject, ObservableObject {
         }
     }
     @MainActor @Published private(set) var backgroundActive = false
+    @MainActor @Published private(set) var locationAuthStatus: CLAuthorizationStatus = .notDetermined
 
     private var server: SOCKSServer?
     private var locationManager: CLLocationManager?
@@ -67,6 +68,10 @@ final class ProxyManager: NSObject, ObservableObject {
         server?.onStateChange = { [weak self] running in
             DispatchQueue.main.async {
                 self?.isRunning = running
+                // Start background mode when server becomes ready (not before)
+                if running {
+                    self?.updateBackgroundMode()
+                }
             }
         }
 
@@ -80,7 +85,7 @@ final class ProxyManager: NSObject, ObservableObject {
             try server?.start()
             logger.info("Proxy started on port \(self.port)")
             startNetworkMonitor()
-            updateBackgroundMode()
+            // Note: updateBackgroundMode() is called from onStateChange when isRunning becomes true
         } catch {
             errorMessage = error.localizedDescription
             logger.error("Failed to start proxy: \(error.localizedDescription)")
@@ -146,6 +151,7 @@ final class ProxyManager: NSObject, ObservableObject {
 
         // Check current authorization and act accordingly
         let status = manager.authorizationStatus
+        locationAuthStatus = status
         logger.info("Background mode starting, current auth status: \(status.rawValue)")
 
         switch status {
@@ -154,10 +160,13 @@ final class ProxyManager: NSObject, ObservableObject {
             manager.startUpdatingLocation()
             backgroundActive = true
         case .authorizedWhenInUse:
-            logger.info("Authorized when in use - requesting always, starting updates")
+            // IMPORTANT: "When In Use" does NOT keep app alive in background!
+            // Start updates anyway (works briefly), but warn user and request upgrade
+            logger.warning("Only 'When In Use' - background will NOT work reliably!")
             manager.requestAlwaysAuthorization()
             manager.startUpdatingLocation()
-            backgroundActive = true
+            // Do NOT set backgroundActive = true - it's misleading
+            errorMessage = "Change location to 'Always' in Settings for background mode"
         case .notDetermined:
             logger.info("Not determined - requesting always authorization")
             manager.requestAlwaysAuthorization()
@@ -238,16 +247,25 @@ extension ProxyManager: CLLocationManagerDelegate {
             manager.startUpdatingLocation()
         }
 
-        // Update UI only when app is active
+        // Update UI state
         DispatchQueue.main.async { [weak self] in
-            guard UIApplication.shared.applicationState == .active else { return }
+            self?.locationAuthStatus = status
+
             switch status {
+            case .authorizedAlways:
+                self?.backgroundActive = true
+                self?.errorMessage = nil
+                logger.info("'Always' authorization granted - background mode will work")
             case .authorizedWhenInUse:
-                logger.warning("Only 'When In Use' - grant 'Always' for reliable background operation.")
+                // This is the critical issue - "When In Use" does NOT keep app alive
+                self?.backgroundActive = false
+                self?.errorMessage = "Change location to 'Always' in Settings for background mode"
+                logger.warning("Only 'When In Use' - background will NOT work!")
             case .denied, .restricted:
                 logger.error("Location access denied")
                 self?.errorMessage = "Location access required for background mode"
                 self?.backgroundEnabled = false
+                self?.backgroundActive = false
             default:
                 break
             }
