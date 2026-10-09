@@ -4,123 +4,148 @@ import OSLog
 
 private let logger = Logger(subsystem: "com.socksproxy", category: "SOCKSServer")
 
-/// SOCKS5 proxy server using Network.framework
+/// SOCKS5 proxy server using Network.framework.
+///
+/// All mutable state is confined to `queue`. Callbacks are delivered on the main queue.
+///
+/// If the listener fails (e.g. its socket is reclaimed while the app was suspended, or
+/// the network configuration changes), it is recreated automatically with backoff until
+/// `stop()` is called.
 final class SOCKSServer {
+    private static let maxRestartDelay: TimeInterval = 30
+
+    private let port: NWEndpoint.Port
+    private let queue = DispatchQueue(label: "com.socksproxy.server", qos: .userInitiated)
     private var listener: NWListener?
     private var connections: [UUID: SOCKSConnection] = [:]
-    private let port: UInt16
-    private let queue = DispatchQueue(label: "com.socksproxy.server", qos: .userInitiated)
+    private var isStopped = false
+    private var restartAttempts = 0
 
-    var isRunning: Bool {
-        listener?.state == .ready
-    }
-
-    var onStateChange: ((Bool) -> Void)?
-    var onConnectionUpdate: ((ConnectionStats) -> Void)?
+    /// Called with `true` when the listener is accepting connections, and `false` when it
+    /// has failed and is being restarted.
+    var onListeningChange: ((Bool) -> Void)?
     var onError: ((Error) -> Void)?
 
-    init(port: UInt16 = 1080) {
-        self.port = port
-    }
-
-    func start() throws {
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-
-        // Don't restrict interface type - hotspot uses bridge interface
-
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+    init(port: UInt16) throws {
+        guard port != 0, let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw SOCKSServerError.invalidPort
         }
+        self.port = nwPort
+    }
 
-        do {
-            listener = try NWListener(using: parameters, on: nwPort)
-        } catch {
-            throw SOCKSServerError.listenerCreationFailed(error)
-        }
-
-        listener?.stateUpdateHandler = { [weak self] state in
-            self?.handleStateChange(state)
-        }
-
-        listener?.newConnectionHandler = { [weak self] connection in
-            self?.handleNewConnection(connection)
-        }
-
-        listener?.start(queue: queue)
-        logger.info("SOCKS server starting on port \(self.port)")
+    func start() {
+        queue.async { self.startListener() }
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
-
-        // Cancel all active connections
-        for (_, connection) in connections {
-            connection.cancel()
+        onListeningChange = nil
+        onError = nil
+        queue.async {
+            self.isStopped = true
+            self.listener?.cancel()
+            self.listener = nil
+            for connection in self.connections.values {
+                connection.close()
+            }
+            self.connections.removeAll()
+            logger.info("SOCKS server stopped")
         }
-        connections.removeAll()
-
-        logger.info("SOCKS server stopped")
-        onStateChange?(false)
     }
 
-    // MARK: - Private Methods
+    // MARK: - Listener
 
-    private func handleStateChange(_ state: NWListener.State) {
+    private func startListener() {
+        guard !isStopped, listener == nil else { return }
+
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        // Detect clients that vanished without closing (e.g. left the hotspot).
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 60
+        let parameters = NWParameters(tls: nil, tcp: tcp)
+        parameters.allowLocalEndpointReuse = true
+
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: parameters, on: port)
+        } catch {
+            logger.error("Failed to create listener: \(error.localizedDescription)")
+            notify(error: SOCKSServerError.listenerCreationFailed(error))
+            scheduleRestart()
+            return
+        }
+
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener else { return }
+            self.listenerStateChanged(state, listener: listener)
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+
+        self.listener = listener
+        listener.start(queue: queue)
+        logger.info("SOCKS server starting on port \(self.port.rawValue)")
+    }
+
+    private func listenerStateChanged(_ state: NWListener.State, listener: NWListener) {
+        guard listener === self.listener else { return }
+
         switch state {
         case .ready:
-            logger.info("SOCKS server ready on port \(self.port)")
-            DispatchQueue.main.async {
-                self.onStateChange?(true)
-            }
+            logger.info("SOCKS server ready on port \(self.port.rawValue)")
+            restartAttempts = 0
+            notify(listening: true)
 
         case .failed(let error):
             logger.error("SOCKS server failed: \(error.localizedDescription)")
-            DispatchQueue.main.async {
-                self.onError?(SOCKSServerError.listenerFailed(error))
-                self.onStateChange?(false)
-            }
-
-        case .cancelled:
-            logger.info("SOCKS server cancelled")
-            DispatchQueue.main.async {
-                self.onStateChange?(false)
-            }
+            listener.cancel()
+            self.listener = nil
+            notify(listening: false)
+            notify(error: SOCKSServerError.listenerFailed(error))
+            scheduleRestart()
 
         default:
             break
         }
     }
 
-    private func handleNewConnection(_ connection: NWConnection) {
-        let endpoint = connection.endpoint
-        logger.info("New connection from \(String(describing: endpoint))")
-
-        let socksConnection = SOCKSConnection(connection: connection) { [weak self] stats in
-            logger.debug("Connection stats callback: \(stats.id) in=\(stats.bytesIn) out=\(stats.bytesOut)")
-
-            DispatchQueue.main.async {
-                guard let self = self else {
-                    logger.warning("Server deallocated, dropping stats update")
-                    return
-                }
-                guard let callback = self.onConnectionUpdate else {
-                    logger.warning("No onConnectionUpdate callback set")
-                    return
-                }
-                callback(stats)
-            }
-
-            if stats.state == .closed {
-                self?.queue.async {
-                    self?.connections.removeValue(forKey: stats.id)
-                }
-            }
+    private func scheduleRestart() {
+        guard !isStopped else { return }
+        let delay = min(pow(2, Double(restartAttempts)), Self.maxRestartDelay)
+        restartAttempts += 1
+        logger.info("Restarting listener in \(delay)s")
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.startListener()
         }
+    }
 
-        connections[socksConnection.id] = socksConnection
-        socksConnection.start()
+    private func accept(_ nwConnection: NWConnection) {
+        guard !isStopped else {
+            nwConnection.cancel()
+            return
+        }
+        logger.debug("New connection from \(String(describing: nwConnection.endpoint))")
+
+        let connection = SOCKSConnection(connection: nwConnection, queue: queue) { [weak self] connection in
+            self?.connections[connection.id] = nil
+        }
+        connections[connection.id] = connection
+        connection.start()
+    }
+
+    // MARK: - Callbacks
+
+    private func notify(listening: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onListeningChange?(listening)
+        }
+    }
+
+    private func notify(error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onError?(error)
+        }
     }
 }
 

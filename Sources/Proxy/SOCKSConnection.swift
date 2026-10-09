@@ -4,313 +4,271 @@ import OSLog
 
 private let logger = Logger(subsystem: "com.socksproxy", category: "SOCKSConnection")
 
-/// Represents the state of a SOCKS connection
-enum ConnectionState {
-    case awaitingGreeting
-    case awaitingRequest
-    case connecting
-    case relaying
-    case closed
-}
-
-/// Statistics for a single connection
-struct ConnectionStats: Identifiable {
-    let id: UUID
-    let startTime: Date
-    var destinationHost: String?
-    var destinationPort: UInt16?
-    var bytesIn: Int64 = 0
-    var bytesOut: Int64 = 0
-    var state: ConnectionState = .awaitingGreeting
-
-    init(id: UUID = UUID()) {
-        self.id = id
-        self.startTime = Date()
-    }
-}
-
-/// Handles a single SOCKS5 client connection
+/// Handles a single SOCKS5 client connection.
+///
+/// All state is confined to `queue`, which must be serial. Both the client and target
+/// `NWConnection`s deliver their callbacks on it, and `close()` must be called on it.
 final class SOCKSConnection {
-    let id: UUID
-    private let clientConnection: NWConnection
-    private var targetConnection: NWConnection?
-    private var state: ConnectionState = .awaitingGreeting
-    private var stats: ConnectionStats
-    private let statsCallback: (ConnectionStats) -> Void
+    private enum State {
+        case awaitingGreeting
+        case awaitingRequest
+        case connecting
+        case relaying
+        /// Sending a final reply before closing; ignore further input.
+        case closing
+        case closed
+    }
 
-    init(connection: NWConnection, statsCallback: @escaping (ConnectionStats) -> Void) {
-        self.id = UUID()
-        self.clientConnection = connection
-        self.stats = ConnectionStats(id: id)
-        self.statsCallback = statsCallback
+    /// Maximum bytes read per receive. Also caps the handshake buffer.
+    private static let maxReadLength = 64 * 1024
+    /// Seconds to wait for the target to accept a connection.
+    private static let connectTimeout = 15
+
+    let id = UUID()
+    private let client: NWConnection
+    private var target: NWConnection?
+    private let queue: DispatchQueue
+    private let onClose: (SOCKSConnection) -> Void
+    private var state = State.awaitingGreeting
+    /// Handshake bytes received but not yet parsed.
+    private var buffer: [UInt8] = []
+    /// Number of relay directions that have seen and forwarded EOF.
+    private var finishedDirections = 0
+
+    init(connection: NWConnection, queue: DispatchQueue, onClose: @escaping (SOCKSConnection) -> Void) {
+        self.client = connection
+        self.queue = queue
+        self.onClose = onClose
     }
 
     func start() {
-        // Notify about new connection immediately
-        statsCallback(stats)
-
-        clientConnection.stateUpdateHandler = { [weak self] state in
-            self?.handleClientStateChange(state)
+        client.stateUpdateHandler = { [weak self] state in
+            self?.clientStateChanged(state)
         }
-        clientConnection.start(queue: .global(qos: .userInitiated))
+        client.start(queue: queue)
     }
 
-    func cancel() {
+    func close() {
+        guard state != .closed else { return }
         state = .closed
-        stats.state = .closed
-        statsCallback(stats)
-        clientConnection.cancel()
-        targetConnection?.cancel()
+        client.cancel()
+        target?.cancel()
+        onClose(self)
     }
 
-    // MARK: - Client State Handling
+    // MARK: - Client
 
-    private func handleClientStateChange(_ newState: NWConnection.State) {
+    private func clientStateChanged(_ newState: NWConnection.State) {
         switch newState {
         case .ready:
-            logger.info("Client connection ready: \(self.id)")
-            receiveFromClient()
-
+            receiveHandshake()
         case .failed(let error):
-            logger.error("Client connection failed: \(error.localizedDescription)")
-            cancel()
-
-        case .cancelled:
-            logger.info("Client connection cancelled: \(self.id)")
-            state = .closed
-
+            logger.debug("Client connection failed: \(error.localizedDescription)")
+            close()
         default:
             break
         }
     }
 
-    // MARK: - Data Reception
+    // MARK: - Handshake
 
-    private func receiveFromClient() {
-        clientConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self = self else { return }
+    private func receiveHandshake() {
+        client.receive(minimumIncompleteLength: 1, maximumLength: Self.maxReadLength) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            guard self.state == .awaitingGreeting || self.state == .awaitingRequest else { return }
 
-            if let error = error {
-                logger.error("Client receive error: \(error.localizedDescription)")
-                self.cancel()
+            if let error {
+                logger.debug("Client receive error during handshake: \(error.localizedDescription)")
+                self.close()
                 return
             }
-
-            if let data = data, !data.isEmpty {
-                self.handleClientData(data)
+            if let data {
+                self.buffer.append(contentsOf: data)
             }
 
-            if isComplete {
-                self.cancel()
-            } else if self.state != .closed {
-                self.receiveFromClient()
-            }
-        }
-    }
+            self.processHandshake()
 
-    private func handleClientData(_ data: Data) {
-        switch state {
-        case .awaitingGreeting:
-            handleGreeting(data)
-
-        case .awaitingRequest:
-            handleRequest(data)
-
-        case .relaying:
-            relayToTarget(data)
-
-        default:
-            break
-        }
-    }
-
-    // MARK: - SOCKS5 Handshake
-
-    private func handleGreeting(_ data: Data) {
-        guard let methodSelection = SOCKS5.MethodSelection(from: data) else {
-            logger.error("Invalid greeting from client")
-            cancel()
-            return
-        }
-
-        // We only support no-auth for simplicity on local network
-        if methodSelection.methods.contains(.noAuth) {
-            let response = SOCKS5.MethodSelection.response(method: .noAuth)
-            sendToClient(response) { [weak self] in
-                self?.state = .awaitingRequest
-                self?.stats.state = .awaitingRequest
-            }
-        } else {
-            let response = SOCKS5.MethodSelection.response(method: .noAcceptable)
-            sendToClient(response) { [weak self] in
-                self?.cancel()
+            // Once the request is parsed, the relay takes over reading from the client.
+            guard self.state == .awaitingGreeting || self.state == .awaitingRequest else { return }
+            if isComplete || self.buffer.count > Self.maxReadLength {
+                self.close()
+            } else {
+                self.receiveHandshake()
             }
         }
     }
 
-    private func handleRequest(_ data: Data) {
-        guard let request = SOCKS5.Request(from: data) else {
-            logger.error("Invalid request from client")
-            sendErrorResponse(.generalFailure)
-            return
+    /// Consumes as many complete handshake messages from `buffer` as are available.
+    /// Clients may pipeline the greeting and request into a single segment.
+    private func processHandshake() {
+        if state == .awaitingGreeting {
+            let parsed: (SOCKS5.MethodSelection, consumed: Int)?
+            do {
+                parsed = try SOCKS5.MethodSelection.parse(buffer)
+            } catch {
+                logger.error("Invalid greeting from client")
+                close()
+                return
+            }
+            guard let (greeting, consumed) = parsed else { return }
+            buffer.removeFirst(consumed)
+
+            // We only support no-auth for simplicity on local network
+            guard greeting.methods.contains(.noAuth) else {
+                sendFinalReply(SOCKS5.MethodSelection.response(method: .noAcceptable))
+                return
+            }
+            // Advance state before sending, so a request arriving before the send
+            // completes is not misread as a second greeting.
+            state = .awaitingRequest
+            sendToClient(SOCKS5.MethodSelection.response(method: .noAuth))
         }
 
-        stats.destinationHost = request.destinationHost
-        stats.destinationPort = request.destinationPort
-        statsCallback(stats)
+        if state == .awaitingRequest {
+            let parsed: (SOCKS5.Request, consumed: Int)?
+            do {
+                parsed = try SOCKS5.Request.parse(buffer)
+            } catch let error as SOCKS5.ParseError {
+                logger.error("Invalid request from client: reply \(error.reply.rawValue)")
+                sendFinalReply(SOCKS5.response(reply: error.reply))
+                return
+            } catch {
+                close()
+                return
+            }
+            guard let (request, consumed) = parsed else { return }
+            buffer.removeFirst(consumed)
 
-        logger.info("CONNECT request to \(request.destinationHost):\(request.destinationPort)")
-
-        switch request.command {
-        case .connect:
-            connectToTarget(host: request.destinationHost, port: request.destinationPort)
-
-        case .bind, .udpAssociate:
-            logger.warning("Unsupported command: \(request.command.rawValue)")
-            sendErrorResponse(.commandNotSupported)
+            guard request.command == .connect else {
+                logger.warning("Unsupported command: \(request.command.rawValue)")
+                sendFinalReply(SOCKS5.response(reply: .commandNotSupported))
+                return
+            }
+            connect(to: request.host, port: request.port)
         }
     }
 
-    // MARK: - Target Connection
+    // MARK: - Target
 
-    private func connectToTarget(host: String, port: UInt16) {
+    private func connect(to host: NWEndpoint.Host, port: NWEndpoint.Port) {
+        logger.info("CONNECT \(String(describing: host)):\(port.rawValue)")
         state = .connecting
-        stats.state = .connecting
-        statsCallback(stats)
 
-        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: port))
-        let connection = NWConnection(to: endpoint, using: .tcp)
+        let tcp = NWProtocolTCP.Options()
+        tcp.connectionTimeout = Self.connectTimeout
+        tcp.noDelay = true
+        tcp.enableKeepalive = true
+        let connection = NWConnection(host: host, port: port, using: NWParameters(tls: nil, tcp: tcp))
 
         connection.stateUpdateHandler = { [weak self] state in
-            self?.handleTargetStateChange(state)
+            self?.targetStateChanged(state)
         }
-
-        targetConnection = connection
-        connection.start(queue: .global(qos: .userInitiated))
+        target = connection
+        connection.start(queue: queue)
     }
 
-    private func handleTargetStateChange(_ newState: NWConnection.State) {
+    private func targetStateChanged(_ newState: NWConnection.State) {
         switch newState {
         case .ready:
-            logger.info("Target connection ready")
-            sendSuccessResponse()
-            startRelaying()
+            guard state == .connecting, let target else { return }
+            state = .relaying
+            sendToClient(SOCKS5.response(reply: .succeeded))
+            // Forward any bytes the client sent after its request (optimistic data).
+            if !buffer.isEmpty {
+                target.send(content: Data(buffer), completion: .contentProcessed { [weak self] error in
+                    if error != nil { self?.close() }
+                })
+                buffer = []
+            }
+            pump(from: client, to: target)
+            pump(from: target, to: client)
+
+        // A connection that can't currently be established (e.g. DNS failure or no route)
+        // sits in .waiting indefinitely. Fail fast instead of leaving the client hanging.
+        case .waiting(let error) where state == .connecting,
+             .failed(let error) where state == .connecting:
+            logger.error("Target connection failed: \(error.localizedDescription)")
+            sendFinalReply(SOCKS5.response(reply: Self.reply(for: error)))
 
         case .failed(let error):
-            logger.error("Target connection failed: \(error.localizedDescription)")
-            handleTargetConnectionError(error)
-
-        case .cancelled:
-            logger.info("Target connection cancelled")
-            cancel()
+            logger.debug("Target connection failed while relaying: \(error.localizedDescription)")
+            close()
 
         default:
             break
         }
     }
 
-    private func handleTargetConnectionError(_ error: NWError) {
-        let reply: SOCKS5.Reply
-
+    private static func reply(for error: NWError) -> SOCKS5.Reply {
         switch error {
-        case .posix(let code):
-            switch code {
-            case .ECONNREFUSED:
-                reply = .connectionRefused
-            case .ENETUNREACH:
-                reply = .networkUnreachable
-            case .EHOSTUNREACH:
-                reply = .hostUnreachable
-            case .ETIMEDOUT:
-                reply = .ttlExpired
-            default:
-                reply = .generalFailure
-            }
+        case .posix(.ECONNREFUSED):
+            return .connectionRefused
+        case .posix(.ENETUNREACH), .posix(.ENETDOWN):
+            return .networkUnreachable
+        case .posix(.EHOSTUNREACH), .posix(.EHOSTDOWN), .dns:
+            return .hostUnreachable
+        case .posix(.ETIMEDOUT):
+            return .ttlExpired
         default:
-            reply = .generalFailure
-        }
-
-        sendErrorResponse(reply)
-    }
-
-    // MARK: - Response Sending
-
-    private func sendSuccessResponse() {
-        let response = SOCKS5.response(reply: .succeeded)
-        sendToClient(response) { [weak self] in
-            self?.state = .relaying
-            self?.stats.state = .relaying
-            self?.statsCallback(self!.stats)
+            return .generalFailure
         }
     }
 
-    private func sendErrorResponse(_ reply: SOCKS5.Reply) {
-        let response = SOCKS5.response(reply: reply)
-        sendToClient(response) { [weak self] in
-            self?.cancel()
-        }
-    }
+    // MARK: - Sending
 
-    private func sendToClient(_ data: Data, completion: @escaping () -> Void) {
-        clientConnection.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error = error {
-                logger.error("Send to client error: \(error.localizedDescription)")
-                self?.cancel()
-                return
+    private func sendToClient(_ data: Data) {
+        client.send(content: data, completion: .contentProcessed { [weak self] error in
+            if let error {
+                logger.debug("Send to client failed: \(error.localizedDescription)")
+                self?.close()
             }
-            completion()
         })
     }
 
-    // MARK: - Data Relaying
-
-    private func startRelaying() {
-        receiveFromTarget()
+    /// Sends `data`, half-closes the client connection, then tears everything down.
+    private func sendFinalReply(_ data: Data) {
+        state = .closing
+        target?.cancel()
+        client.send(content: data, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+            self?.close()
+        })
     }
 
-    private func receiveFromTarget() {
-        targetConnection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self = self else { return }
+    // MARK: - Relaying
 
-            if let error = error {
-                logger.error("Target receive error: \(error.localizedDescription)")
-                self.cancel()
+    /// Copies bytes from `source` to `destination` until EOF.
+    ///
+    /// The next read is only issued once the previous chunk has been handed off, so a
+    /// slow peer applies backpressure instead of letting buffered data grow unbounded
+    /// (which risks the app being killed for memory use while in the background).
+    private func pump(from source: NWConnection, to destination: NWConnection) {
+        source.receive(minimumIncompleteLength: 1, maximumLength: Self.maxReadLength) { [weak self] data, _, isComplete, error in
+            guard let self, self.state == .relaying else { return }
+
+            if let error {
+                logger.debug("Relay receive error: \(error.localizedDescription)")
+                self.close()
                 return
             }
 
-            if let data = data, !data.isEmpty {
-                self.relayToClient(data)
-            }
+            // On EOF, forward a FIN so the other side sees a half-close rather than
+            // tearing down the connection while the reverse direction may still have data.
+            let context: NWConnection.ContentContext = isComplete ? .finalMessage : .defaultMessage
+            destination.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { [weak self] error in
+                guard let self, self.state == .relaying else { return }
 
-            if isComplete {
-                self.cancel()
-            } else if self.state == .relaying {
-                self.receiveFromTarget()
-            }
+                if let error {
+                    logger.debug("Relay send error: \(error.localizedDescription)")
+                    self.close()
+                } else if isComplete {
+                    self.finishedDirections += 1
+                    if self.finishedDirections == 2 {
+                        self.close()
+                    }
+                } else {
+                    self.pump(from: source, to: destination)
+                }
+            })
         }
-    }
-
-    private func relayToTarget(_ data: Data) {
-        stats.bytesIn += Int64(data.count)
-        statsCallback(stats)
-
-        targetConnection?.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error = error {
-                logger.error("Relay to target error: \(error.localizedDescription)")
-                self?.cancel()
-            }
-        })
-    }
-
-    private func relayToClient(_ data: Data) {
-        stats.bytesOut += Int64(data.count)
-        statsCallback(stats)
-
-        clientConnection.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error = error {
-                logger.error("Relay to client error: \(error.localizedDescription)")
-                self?.cancel()
-            }
-        })
     }
 }

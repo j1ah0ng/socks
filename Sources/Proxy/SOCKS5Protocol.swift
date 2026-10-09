@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// SOCKS5 Protocol implementation based on RFC 1928
 enum SOCKS5 {
@@ -46,29 +47,32 @@ enum SOCKS5 {
         case addressTypeNotSupported = 0x08
     }
 
+    /// A malformed or unsupported message. `reply` is the code to send back, if the
+    /// handshake has progressed far enough for a reply to be meaningful.
+    struct ParseError: Error {
+        let reply: Reply
+    }
+
     // MARK: - Greeting
 
     struct MethodSelection {
         let methods: [AuthMethod]
 
-        init?(from data: Data) {
-            guard data.count >= 2 else { return nil }
-            guard data[0] == SOCKS5.version else { return nil }
+        /// Parses a greeting from the front of `bytes`.
+        /// Returns nil if more bytes are needed; throws if the greeting is malformed.
+        static func parse(_ bytes: [UInt8]) throws -> (MethodSelection, consumed: Int)? {
+            guard bytes.count >= 2 else { return nil }
+            guard bytes[0] == SOCKS5.version else { throw ParseError(reply: .generalFailure) }
 
-            let methodCount = Int(data[1])
-            guard data.count >= 2 + methodCount else { return nil }
+            let length = 2 + Int(bytes[1])
+            guard bytes.count >= length else { return nil }
 
-            var methods: [AuthMethod] = []
-            for i in 0..<methodCount {
-                if let method = AuthMethod(rawValue: data[2 + i]) {
-                    methods.append(method)
-                }
-            }
-            self.methods = methods
+            let methods = bytes[2..<length].compactMap(AuthMethod.init(rawValue:))
+            return (MethodSelection(methods: methods), length)
         }
 
         static func response(method: AuthMethod) -> Data {
-            return Data([SOCKS5.version, method.rawValue])
+            Data([SOCKS5.version, method.rawValue])
         }
     }
 
@@ -76,95 +80,67 @@ enum SOCKS5 {
 
     struct Request {
         let command: Command
-        let addressType: AddressType
-        let destinationHost: String
-        let destinationPort: UInt16
+        let host: NWEndpoint.Host
+        let port: NWEndpoint.Port
 
-        init?(from data: Data) {
-            guard data.count >= 4 else { return nil }
-            guard data[0] == SOCKS5.version else { return nil }
-
-            guard let cmd = Command(rawValue: data[1]) else { return nil }
-            self.command = cmd
-
-            // data[2] is reserved (0x00)
-
-            guard let addrType = AddressType(rawValue: data[3]) else { return nil }
-            self.addressType = addrType
+        /// Parses a request from the front of `bytes`.
+        /// Returns nil if more bytes are needed; throws if the request is malformed or unsupported.
+        static func parse(_ bytes: [UInt8]) throws -> (Request, consumed: Int)? {
+            guard bytes.count >= 4 else { return nil }
+            guard bytes[0] == SOCKS5.version else { throw ParseError(reply: .generalFailure) }
+            guard let command = Command(rawValue: bytes[1]) else { throw ParseError(reply: .commandNotSupported) }
+            // bytes[2] is reserved
 
             var offset = 4
-            let host: String
+            let host: NWEndpoint.Host
 
-            switch addressType {
+            switch AddressType(rawValue: bytes[3]) {
             case .ipv4:
-                guard data.count >= offset + 4 + 2 else { return nil }
-                let ip = data[offset..<(offset + 4)]
-                host = ip.map { String($0) }.joined(separator: ".")
+                guard bytes.count >= offset + 4 + 2 else { return nil }
+                guard let address = IPv4Address(Data(bytes[offset..<(offset + 4)])) else {
+                    throw ParseError(reply: .generalFailure)
+                }
+                host = .ipv4(address)
                 offset += 4
 
-            case .domainName:
-                guard data.count >= offset + 1 else { return nil }
-                let domainLength = Int(data[offset])
-                offset += 1
-                guard data.count >= offset + domainLength + 2 else { return nil }
-                guard let domain = String(data: data[offset..<(offset + domainLength)], encoding: .utf8) else {
-                    return nil
-                }
-                host = domain
-                offset += domainLength
-
             case .ipv6:
-                guard data.count >= offset + 16 + 2 else { return nil }
-                let ip = data[offset..<(offset + 16)]
-                var parts: [String] = []
-                for i in stride(from: 0, to: 16, by: 2) {
-                    let value = UInt16(ip[ip.startIndex + i]) << 8 | UInt16(ip[ip.startIndex + i + 1])
-                    parts.append(String(format: "%x", value))
+                guard bytes.count >= offset + 16 + 2 else { return nil }
+                guard let address = IPv6Address(Data(bytes[offset..<(offset + 16)])) else {
+                    throw ParseError(reply: .generalFailure)
                 }
-                host = parts.joined(separator: ":")
+                host = .ipv6(address)
                 offset += 16
+
+            case .domainName:
+                guard bytes.count >= offset + 1 else { return nil }
+                let length = Int(bytes[offset])
+                offset += 1
+                guard bytes.count >= offset + length + 2 else { return nil }
+                guard length > 0, let name = String(bytes: bytes[offset..<(offset + length)], encoding: .utf8) else {
+                    throw ParseError(reply: .generalFailure)
+                }
+                host = NWEndpoint.Host(name)
+                offset += length
+
+            case nil:
+                throw ParseError(reply: .addressTypeNotSupported)
             }
 
-            self.destinationHost = host
+            let rawPort = UInt16(bytes[offset]) << 8 | UInt16(bytes[offset + 1])
+            guard rawPort != 0, let port = NWEndpoint.Port(rawValue: rawPort) else {
+                throw ParseError(reply: .generalFailure)
+            }
+            offset += 2
 
-            guard data.count >= offset + 2 else { return nil }
-            self.destinationPort = UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
+            return (Request(command: command, host: host, port: port), offset)
         }
     }
 
     // MARK: - Response Builder
 
-    static func response(reply: Reply, addressType: AddressType = .ipv4, bindAddress: String = "0.0.0.0", bindPort: UInt16 = 0) -> Data {
-        var response = Data([
-            SOCKS5.version,
-            reply.rawValue,
-            0x00,  // Reserved
-            addressType.rawValue
-        ])
-
-        switch addressType {
-        case .ipv4:
-            let parts = bindAddress.split(separator: ".").compactMap { UInt8($0) }
-            if parts.count == 4 {
-                response.append(contentsOf: parts)
-            } else {
-                response.append(contentsOf: [0, 0, 0, 0])
-            }
-
-        case .domainName:
-            let domainData = Data(bindAddress.utf8)
-            response.append(UInt8(domainData.count))
-            response.append(domainData)
-
-        case .ipv6:
-            // Simplified: just append 16 zero bytes
-            response.append(contentsOf: [UInt8](repeating: 0, count: 16))
-        }
-
-        // Port in network byte order (big-endian)
-        response.append(UInt8(bindPort >> 8))
-        response.append(UInt8(bindPort & 0xFF))
-
-        return response
+    /// Builds a request reply. The bound address is always reported as 0.0.0.0:0,
+    /// which clients accept for CONNECT.
+    static func response(reply: Reply) -> Data {
+        Data([SOCKS5.version, reply.rawValue, 0x00, AddressType.ipv4.rawValue, 0, 0, 0, 0, 0, 0])
     }
 }

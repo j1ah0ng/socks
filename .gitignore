@@ -88,3 +88,7 @@ Thumbs.db
 # Crash logs
 *.crash
 *.ips
+
+# Exported archives
+*.ipa
+SOCKSProxy [0-9]*-[0-9]*-[0-9]* *-*-*/

@@ -34,6 +34,22 @@ struct ContentView: View {
         }
     }
 
+    private var statusText: String {
+        switch (proxyManager.isRunning, proxyManager.isListening) {
+        case (false, _): return "Stopped"
+        case (true, false): return "Starting…"
+        case (true, true): return "Running"
+        }
+    }
+
+    private var statusColor: Color {
+        switch (proxyManager.isRunning, proxyManager.isListening) {
+        case (false, _): return .secondary
+        case (true, false): return .orange
+        case (true, true): return .green
+        }
+    }
+
     // MARK: - Sections
 
     private var statusSection: some View {
@@ -42,9 +58,9 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Proxy Status")
                         .font(.headline)
-                    Text(proxyManager.isRunning ? "Running" : "Stopped")
+                    Text(statusText)
                         .font(.subheadline)
-                        .foregroundStyle(proxyManager.isRunning ? .green : .secondary)
+                        .foregroundStyle(statusColor)
                 }
 
                 Spacer()
@@ -100,7 +116,7 @@ struct ContentView: View {
         Section("Proxy Address") {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(proxyManager.proxyAddress)
+                    Text(proxyAddressText)
                         .font(.system(.body, design: .monospaced))
                         .fontWeight(.medium)
                     Text("Configure clients to use this SOCKS5 proxy")
@@ -110,9 +126,9 @@ struct ContentView: View {
 
                 Spacer()
 
-                if proxyManager.isRunning {
+                if proxyManager.isRunning, let address = proxyManager.hotspotAddress {
                     Button {
-                        UIPasteboard.general.string = proxyManager.proxyAddress
+                        UIPasteboard.general.string = address
                     } label: {
                         Image(systemName: "doc.on.doc")
                     }
@@ -122,41 +138,40 @@ struct ContentView: View {
         }
     }
 
+    private var proxyAddressText: String {
+        guard proxyManager.isRunning else { return "Not running" }
+        return proxyManager.hotspotAddress ?? "Enable Hotspot to get address"
+    }
+
     private var backgroundSection: some View {
         Section {
             Toggle("Run in Background", isOn: $proxyManager.backgroundEnabled)
 
-            if proxyManager.backgroundEnabled {
-                if proxyManager.backgroundActive {
-                    HStack {
-                        Image(systemName: "location.fill")
-                            .foregroundStyle(.green)
-                        Text("Background mode active")
+            if proxyManager.backgroundEnabled && proxyManager.isRunning {
+                switch proxyManager.locationAuthStatus {
+                case .authorizedAlways:
+                    backgroundActiveLabel
+                case .authorizedWhenInUse:
+                    VStack(alignment: .leading, spacing: 8) {
+                        backgroundActiveLabel
+                        Text("\"Always\" location access is more reliable")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(.orange)
+                        openSettingsButton("Open Settings → Change to \"Always\"")
                     }
-                } else if proxyManager.locationAuthStatus == .authorizedWhenInUse {
-                    // Critical warning - "When In Use" won't work
+                case .denied, .restricted:
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.orange)
-                            Text("\"When In Use\" won't keep proxy alive")
+                            Text("Location access is required for background mode")
                                 .font(.caption)
                                 .fontWeight(.semibold)
                                 .foregroundStyle(.orange)
                         }
-
-                        Button {
-                            if let url = URL(string: UIApplication.openSettingsURLString) {
-                                UIApplication.shared.open(url)
-                            }
-                        } label: {
-                            Label("Open Settings → Change to \"Always\"", systemImage: "gear")
-                                .font(.caption)
-                        }
+                        openSettingsButton("Open Settings → Allow location")
                     }
-                } else if proxyManager.locationAuthStatus == .notDetermined {
+                default:
                     HStack {
                         Image(systemName: "location")
                             .foregroundStyle(.secondary)
@@ -167,7 +182,28 @@ struct ContentView: View {
                 }
             }
         } footer: {
-            Text("Requires \"Always\" location permission. Uses minimal battery (3km accuracy).")
+            Text("Keeps the proxy alive using location services. \"Always\" permission recommended. Uses minimal battery (3km accuracy).")
+        }
+    }
+
+    private var backgroundActiveLabel: some View {
+        HStack {
+            Image(systemName: "location.fill")
+                .foregroundStyle(.green)
+            Text("Background mode active")
+                .font(.caption)
+                .foregroundStyle(.green)
+        }
+    }
+
+    private func openSettingsButton(_ title: String) -> some View {
+        Button {
+            if let url = URL(string: UIApplication.openSettingsURLString) {
+                UIApplication.shared.open(url)
+            }
+        } label: {
+            Label(title, systemImage: "gear")
+                .font(.caption)
         }
     }
 }
